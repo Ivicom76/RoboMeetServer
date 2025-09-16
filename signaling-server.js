@@ -62,7 +62,11 @@ wss.on('connection', (ws) => {
       return;
     }
     const { type } = data;
-
+    // életjel a klienstől → válasz pong
+    if (type === 'ping') {
+      ws.send(JSON.stringify({ type: 'pong', t: Date.now() }));
+      return; // NE menjen tovább az UNKNOWN logolásig
+    }
     // szobához csatlakozás
     if (type === 'join') {
       const room = data.room;
