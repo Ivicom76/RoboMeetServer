@@ -1,0 +1,16 @@
+{
+  "name": "webrtc-signaling-server",
+  "version": "1.0.0",
+  "private": true,
+  "main": "signaling-server.js",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node signaling-server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
