@@ -113,6 +113,12 @@ wss.on('connection', (ws) => {
     if (r && rooms.has(r)) {
       const set = rooms.get(r);
       set.delete(ws);
+      // ÚJ: szóljunk a bent maradt peer(ek)nek, hogy ez a kliens lelépett
+      set.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(JSON.stringify({ type: 'peer-left', name: ws.meta.name }));
+        }
+      });
       if (set.size === 0) rooms.delete(r); // üres szoba törlése
       console.log(`[LEAVE] room=${r} name=${ws.meta.name}`);
     }
