@@ -54,6 +54,7 @@ wss.on('connection', (ws) => {
 
   // bejövő üzenetek feldolgozása
   ws.on('message', raw => {
+    if (typeof raw === 'string' && raw.length > 65536) return;
     let data;
     try {
       data = JSON.parse(raw); // JSON üzenetek elvártak
@@ -87,6 +88,9 @@ wss.on('connection', (ws) => {
       ws.meta.name = name;
       set.add(ws);
       console.log(`[JOIN] room=${room} name=${name} peers=${set.size}`);
+      const names = Array.from(set).map(x => x.meta?.name).filter(Boolean);
+      ws.send(JSON.stringify({ type: 'room-state', room, peers: names }));
+
 
       // szoba többi tagjának jelzés
       broadcast(room, ws, JSON.stringify({ type: 'peer-joined', name }));
@@ -103,6 +107,34 @@ wss.on('connection', (ws) => {
       return;
     }
 
+// Telefonos hívás-flow: ring / ring-accept / ring-cancel
+if (type === 'ring' || type === 'ring-accept' || type === 'ring-cancel') {
+  const room = ws.meta.room;
+  const from = ws.meta.name;
+  const out = {
+    type,
+    room,
+    from,
+    name: data.name || from,
+    ts: Date.now()
+  };
+
+  // csak a másik félnek küldjük (sender kihagyása)
+  const set = rooms.get(room) || new Set();
+  let delivered = 0;
+  set.forEach(peer => {
+    if (peer !== ws && peer.readyState === WebSocket.OPEN) {
+      try { peer.send(JSON.stringify(out)); delivered++; } catch (_) {}
+    }
+  });
+
+  // ring-re adunk kézbesítési visszaigazolást a hívónak
+  if (type === 'ring') {
+    ws.send(JSON.stringify({ type: 'ring-ack', room, delivered }));
+  }
+  return;
+}
+
     // ismeretlen üzenettípus
     console.log('[UNKNOWN]', data);
   });
@@ -113,14 +145,10 @@ wss.on('connection', (ws) => {
     if (r && rooms.has(r)) {
       const set = rooms.get(r);
       set.delete(ws);
-      // ÚJ: szóljunk a bent maradt peer(ek)nek, hogy ez a kliens lelépett
-      set.forEach(client => {
-        if (client.readyState === WebSocket.OPEN) {
-          client.send(JSON.stringify({ type: 'peer-left', name: ws.meta.name }));
-        }
-      });
       if (set.size === 0) rooms.delete(r); // üres szoba törlése
       console.log(`[LEAVE] room=${r} name=${ws.meta.name}`);
+      // jelezzük a bent maradónak
+      broadcast(r, ws, JSON.stringify({ type: 'peer-left', name: ws.meta.name }));
     }
   });
 });
