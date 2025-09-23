@@ -1,12 +1,6 @@
 /*
   WebRTC signaling – stabil RING/START protokoll call_id-val.
 
-  Fő elvek:
-  - Minden hívásnak van CALL_ID (uuid) → csak erre engedünk WebRTC-t.
-  - Szerver-vezérelt kapu: OFFER/ANSWER/ICE csak START után mehet.
-  - Régi/kései csomagok eldobása (call_id + epoch).
-  - RING és RINGING üzenetek ACK-kal, egyszerű automata újraküldéssel.
-
   Üzenetek (mind JSON):
   C → S:
     join{room,name}
@@ -15,14 +9,14 @@
     accept{call_id}
     decline{call_id}
     hangup{call_id}
-
-    offer{call_id,sdp} / answer{call_id,sdp} / ice{call_id,candidate{...}}  // csak START után!
+    offer{call_id,sdp} / answer{call_id,sdp} / ice{call_id,candidate{...}}  // CSAK START után!
 
   S → C:
     room-state{room,peers[]}
+    invite-ok{call_id}
     ring{call_id,from}
-    ringing{call_id}                          // csak callernek, ha callee ACK-olt
-    start{call_id, role:"initiator"|"callee"} // ezután mehet a WebRTC
+    ringing{call_id}                          // callernek, ha callee ACK-olt
+    start{call_id, role:"initiator"|"callee"} // csak ezután mehet a WebRTC
     end{call_id, reason:"declined"|"hangup"|"timeout"|"left"}
     busy{reason}
     error{msg}
@@ -41,7 +35,7 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocket.Server({ server });
 
-const rooms = new Map(); // room -> { members:Set<ws>, activeCall: { id, caller, callee, state, started, createdAt }, epoch:number }
+const rooms = new Map(); // room -> { members:Set<ws>, activeCall:{ id, room, caller, callee, state, started }, epoch:number }
 const RING_RETRY_MS = 800;
 const RING_RETRY_MAX = 6;
 
@@ -54,62 +48,51 @@ function bcast(roomObj, except, obj) {
   roomObj.members.forEach(ws => { if (ws !== except && ws.readyState === WebSocket.OPEN) send(ws, obj); });
 }
 function setMeta(ws, patch) { ws.meta = Object.assign(ws.meta || { room:null, name:null }, patch); }
-function clearActiveCall(roomObj, reason) {
-  const call = roomObj.activeCall;
-  if (!call) return;
-  // lezárjuk mindkét fél felé
-  roomObj.members.forEach(ws => {
-    if (ws.meta?.room === call.room) send(ws, { type:'end', call_id: call.id, reason });
-  });
-  roomObj.activeCall = null;
-  roomObj.epoch++;
-}
-
 function currentPeers(roomObj) {
   const names = [];
-  roomObj.members.forEach(ws => { if (ws.meta?.name) names.push(ws.meta.name); });
+  roomObj.members.forEach(ws => ws.meta?.name && names.push(ws.meta.name));
   return names;
 }
 
-// RING újraküldő tároló
-const ringTimers = new Map(); // call_id -> { room, toWs, tries }
-
+const ringTimers = new Map(); // call_id -> { roomObj, to, tries, timer }
 function scheduleRingResend(call_id, roomObj, target) {
-  const key = call_id;
-  ringTimers.get(key)?.timer && clearTimeout(ringTimers.get(key).timer);
-  const entry = ringTimers.get(key) || { tries: 0, room: roomObj, to: target, timer: null };
-  if (entry.tries >= RING_RETRY_MAX) { return; }
+  const prev = ringTimers.get(call_id);
+  if (prev?.timer) clearTimeout(prev.timer);
+  const entry = prev || { tries: 0, roomObj, to: target, timer: null };
+  if (entry.tries >= RING_RETRY_MAX) return;
   entry.tries++;
   entry.timer = setTimeout(() => {
-    const still = roomObj.activeCall && roomObj.activeCall.id === call_id && !roomObj.activeCall.started;
-    if (!still) return;
-    if (entry.to?.readyState === WebSocket.OPEN) send(entry.to, { type: 'ring', call_id, from: roomObj.activeCall.caller?.meta?.name || 'peer' });
+    const call = roomObj.activeCall;
+    if (!call || call.id !== call_id || call.started) return;
+    if (entry.to?.readyState === WebSocket.OPEN) {
+      send(entry.to, { type:'ring', call_id, from: call.caller?.meta?.name || 'peer' });
+    }
     scheduleRingResend(call_id, roomObj, target);
   }, RING_RETRY_MS);
-  ringTimers.set(key, entry);
+  ringTimers.set(call_id, entry);
 }
 function stopRingResend(call_id) {
   const e = ringTimers.get(call_id);
   if (e?.timer) clearTimeout(e.timer);
   ringTimers.delete(call_id);
 }
-
-function leaveRoom(ws) {
-  const rname = ws.meta?.room;
-  if (!rname) return;
-  const roomObj = rooms.get(rname);
-  if (!roomObj) return;
-
-  roomObj.members.delete(ws);
-
-  // Ha folyamatban lévő hívás résztvevője volt → END
+function clearActiveCall(roomObj, reason) {
   const call = roomObj.activeCall;
-  if (call && (call.caller === ws || call.callee === ws)) {
-    stopRingResend(call.id);
-    clearActiveCall(roomObj, 'left');
-  }
-
-  if (roomObj.members.size === 0) rooms.delete(rname);
+  if (!call) return;
+  stopRingResend(call.id);
+  roomObj.members.forEach(ws => send(ws, { type:'end', call_id: call.id, reason }));
+  roomObj.activeCall = null;
+  roomObj.epoch++;
+}
+function leaveRoom(ws) {
+  const r = ws.meta?.room;
+  if (!r) return;
+  const roomObj = rooms.get(r);
+  if (!roomObj) return;
+  roomObj.members.delete(ws);
+  const call = roomObj.activeCall;
+  if (call && (ws === call.caller || ws === call.callee)) clearActiveCall(roomObj, 'left');
+  if (roomObj.members.size === 0) rooms.delete(r);
 }
 
 wss.on('connection', (ws) => {
@@ -123,10 +106,11 @@ wss.on('connection', (ws) => {
     const t = msg.type;
 
     if (t === 'join') {
-      const roomObj = getRoom(String(msg.room || 'default'));
-      setMeta(ws, { room: String(msg.room || 'default'), name: String(msg.name || 'peer') });
+      const room = String(msg.room || 'default');
+      const roomObj = getRoom(room);
+      setMeta(ws, { room, name: String(msg.name || 'peer') });
       roomObj.members.add(ws);
-      send(ws, { type:'room-state', room: ws.meta.room, peers: currentPeers(roomObj) });
+      send(ws, { type:'room-state', room, peers: currentPeers(roomObj) });
       return;
     }
 
@@ -134,15 +118,13 @@ wss.on('connection', (ws) => {
     if (!roomObj) { send(ws, { type:'error', msg:'not in room' }); return; }
 
     if (t === 'invite') {
-      // csak 2 fős hívás
       if (roomObj.activeCall) { send(ws, { type:'busy', reason:'call-active' }); return; }
-      // keressünk partner(eke)t
       let callee = null;
       for (const m of roomObj.members) { if (m !== ws) { callee = m; break; } }
       if (!callee) { send(ws, { type:'busy', reason:'no-peer' }); return; }
 
       const call_id = randomUUID();
-      roomObj.activeCall = { id: call_id, room: ws.meta.room, caller: ws, callee, state:'RINGING', started:false, createdAt: Date.now() };
+      roomObj.activeCall = { id: call_id, room: ws.meta.room, caller: ws, callee, state:'RINGING', started:false };
       send(ws, { type:'invite-ok', call_id });
       send(callee, { type:'ring', call_id, from: ws.meta.name || 'peer' });
       scheduleRingResend(call_id, roomObj, callee);
@@ -160,16 +142,10 @@ wss.on('connection', (ws) => {
     if (t === 'accept' || t === 'decline') {
       const call = roomObj.activeCall;
       if (!call || call.id !== msg.call_id) return;
-      if (t === 'decline') {
-        stopRingResend(call.id);
-        clearActiveCall(roomObj, 'declined');
-        return;
-      }
-      // accept
+      if (t === 'decline') { clearActiveCall(roomObj, 'declined'); return; }
       call.state = 'CONNECTING';
       call.started = true;
       stopRingResend(call.id);
-      // caller lesz az initiator
       send(call.caller, { type:'start', call_id: call.id, role:'initiator' });
       send(call.callee, { type:'start', call_id: call.id, role:'callee' });
       return;
@@ -178,27 +154,20 @@ wss.on('connection', (ws) => {
     if (t === 'hangup') {
       const call = roomObj.activeCall;
       if (!call || call.id !== msg.call_id) return;
-      stopRingResend(call.id);
       clearActiveCall(roomObj, 'hangup');
       return;
     }
 
-    // WebRTC jelzések – csak AKTÍV call_id-ra és csak START után!
+    // WebRTC jelzések – CSAK aktív call_id-ra és CSAK START után!
     if (t === 'offer' || t === 'answer' || t === 'ice') {
       const call = roomObj.activeCall;
-      if (!call || call.id !== msg.call_id || !call.started) {
-        // drop
-        return;
-      }
-      const target = (ws === call.caller) ? call.callee : call.caller;
-      send(target, msg);
+      if (!call || call.id !== msg.call_id || !call.started) return; // drop
+      const to = (ws === call.caller) ? call.callee : call.caller;
+      send(to, msg);
       return;
     }
 
-    if (t === 'leave-room') {
-      leaveRoom(ws);
-      return;
-    }
+    if (t === 'leave-room') { leaveRoom(ws); return; }
   });
 
   ws.on('close', () => leaveRoom(ws));
